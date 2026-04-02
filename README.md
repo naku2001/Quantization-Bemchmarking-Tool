@@ -1,6 +1,6 @@
 **LLM Quantization Benchmarking Tool**
 
-> Benchmark Ollama models across quantization levels — measuring speed, throughput, and semantic quality degradation entirely on CPU-only hardware.
+> Benchmark Ollama models across quantization levels  measuring speed, throughput, and semantic quality degradation entirely on CPU-only hardware.
 
 ---
 

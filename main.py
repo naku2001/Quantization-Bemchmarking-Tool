@@ -1,6 +1,6 @@
-"""quant-bench — CLI entry point.
+"""variant-bench — CLI entry point.
 
-Run ``python main.py --help`` for usage information.
+Run ``variant-bench --help`` for usage information.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from typing import Any
 import click
 from rich.console import Console
 
+from benchmark.hardware import detect_hardware, enrich_with_gpu_layers
 from benchmark.quality import QualityScorer
 from benchmark.reporter import Reporter
 from benchmark.runner import BenchmarkRunner, OllamaConnectionError
@@ -46,7 +47,6 @@ def _load_prompts(path: str) -> list[str]:
     if p.exists():
         content = p.read_text(encoding="utf-8")
     else:
-        # Fall back to bundled package data (works for pip-installed package).
         try:
             pkg_file = _pkg_files("benchmark.prompts").joinpath(p.name)
             content = pkg_file.read_text(encoding="utf-8")
@@ -73,38 +73,24 @@ def _load_prompts(path: str) -> list[str]:
     return prompts
 
 
-def _pick_baseline_quant(results: list[dict[str, Any]]) -> str:
-    """Choose the best quant label to use as the quality baseline.
-
-    Prefers Q8 (or variants like Q8_0).  Falls back to the quant whose label
-    sorts last lexicographically (a rough heuristic for "highest quality").
-
-    Args:
-        results: List of model result dicts.
-
-    Returns:
-        The quant label string to use as baseline.
-    """
-    quants = [r.get("quant", "") for r in results]
-
-    # Prefer any Q8 variant.
-    for q in quants:
-        if q.upper().startswith("Q8"):
-            return q
-
-    # Fall back to highest lexicographic quant (e.g. Q6 > Q5 > Q4).
-    if quants:
-        return max(quants)
-
-    return "unknown"
-
-
 @click.command()
 @click.option(
-    "--model",
+    "--family",
+    default=None,
+    help=(
+        "Model family prefix to benchmark all pulled variants of "
+        "(e.g. 'qwen2.5' matches qwen2.5:3b, qwen2.5:7b, qwen2.5:14b). "
+        "Mutually exclusive with --models."
+    ),
+)
+@click.option(
+    "--models",
     multiple=True,
-    required=True,
-    help="Ollama model name. Repeatable for multiple models.",
+    help=(
+        "Explicit list of model tags to benchmark "
+        "(e.g. --models qwen2.5:3b --models llama3:8b). "
+        "Mutually exclusive with --family."
+    ),
 )
 @click.option(
     "--runs",
@@ -142,24 +128,42 @@ def _pick_baseline_quant(results: list[dict[str, Any]]) -> str:
     ),
 )
 def main(
-    model: tuple[str, ...],
+    family: str | None,
+    models: tuple[str, ...],
     runs: int,
     prompts: str,
     output_format: str,
     output: str,
     context_sweep: bool,
 ) -> None:
-    """Benchmark Ollama models across quantization levels.
+    """Benchmark Ollama model variants by size and family.
 
-    Measures Time to First Token, throughput (tokens/sec), and semantic
-    quality degradation relative to the highest available quantization.
+    Answers: which model variant gives the best quality-per-second tradeoff
+    on your hardware?
+
+    Use --family to benchmark all pulled variants of a model family, or
+    --models to benchmark an explicit list of model tags.
     """
+    if family and models:
+        console.print(
+            "[bold red]Error:[/bold red] --family and --models are mutually exclusive. "
+            "Use one or the other."
+        )
+        sys.exit(1)
+
+    if not family and not models:
+        console.print(
+            "[bold red]Error:[/bold red] Specify either --family <name> or "
+            "--models <tag> [--models <tag> …]."
+        )
+        sys.exit(1)
+
     # ------------------------------------------------------------------ #
-    # 1. Set up runner and verify Ollama is reachable.                    #
+    # 1. Ollama connection check.                                         #
     # ------------------------------------------------------------------ #
     runner = BenchmarkRunner()
 
-    console.print("[bold cyan]quant-bench[/bold cyan] — LLM Quantization Benchmarking Tool")
+    console.print("[bold cyan]variant-bench[/bold cyan] — Model Variant Benchmarking Tool")
     console.print(f"Connecting to Ollama at {runner.base_url} …")
 
     try:
@@ -171,7 +175,36 @@ def main(
     console.print("[green]Ollama is reachable.[/green]\n")
 
     # ------------------------------------------------------------------ #
-    # 2. Load prompts.                                                    #
+    # 2. Hardware detection.                                              #
+    # ------------------------------------------------------------------ #
+    hw = detect_hardware()
+    console.print(f"Hardware detected: [bold]{hw.label}[/bold]\n")
+
+    # ------------------------------------------------------------------ #
+    # 3. Resolve model list.                                              #
+    # ------------------------------------------------------------------ #
+    if family:
+        model_list = runner.list_models(family=family)
+        if not model_list:
+            console.print(
+                f"[bold red]Error:[/bold red] No pulled models found matching "
+                f"family prefix '{family}'. Run 'ollama list' to see what's available."
+            )
+            sys.exit(1)
+        console.print(
+            f"Family [cyan]{family}[/cyan] — found "
+            f"[bold]{len(model_list)}[/bold] variant(s): "
+            + ", ".join(m["name"] for m in model_list)
+        )
+    else:
+        model_list = [{"name": tag, "params": ""} for tag in models]
+        console.print(
+            f"Benchmarking [bold]{len(model_list)}[/bold] model(s): "
+            + ", ".join(m["name"] for m in model_list)
+        )
+
+    # ------------------------------------------------------------------ #
+    # 4. Load prompts.                                                    #
     # ------------------------------------------------------------------ #
     prompt_list = _load_prompts(prompts)
     console.print(
@@ -187,7 +220,7 @@ def main(
     reporter = Reporter(output_dir=output)
 
     # ------------------------------------------------------------------ #
-    # 3a. Context-sweep mode.                                             #
+    # 5a. Context-sweep mode.                                             #
     # ------------------------------------------------------------------ #
     if context_sweep:
         console.print(
@@ -196,34 +229,20 @@ def main(
         )
         all_sweep_results: list[dict[str, Any]] = []
 
-        for model_name in model:
-            console.rule(f"[bold yellow]Model: {model_name}[/bold yellow]")
-            variants = runner.list_model_variants(model_name)
-            console.print(
-                f"Found [bold]{len(variants)}[/bold] variant(s): "
-                + ", ".join(v["name"] for v in variants)
-            )
-
-            for variant in variants:
-                console.print(
-                    f"\nContext sweep: [cyan]{variant['name']}[/cyan] "
-                    f"(quant: [yellow]{variant['quant']}[/yellow]) …"
-                )
-                with console.status("Running sweep across 3 context sizes…"):
-                    sweep = runner.run_context_sweep(variant["name"], prompt_list, runs)
-                all_sweep_results.extend(sweep)
-                console.print(f"  [green]Done.[/green] ({len(sweep)} context sizes)")
+        for model_info in model_list:
+            model_name = model_info["name"]
+            console.print(f"Sweeping [cyan]{model_name}[/cyan] …")
+            with console.status("Running sweep across 3 context sizes…"):
+                sweep = runner.run_context_sweep(model_name, prompt_list, runs)
+            all_sweep_results.extend(sweep)
+            console.print(f"  [green]Done.[/green]")
 
         if not all_sweep_results:
             console.print("[bold red]No results collected. Exiting.[/bold red]")
             sys.exit(1)
 
         console.rule("[bold]Quality Scoring[/bold]")
-        baseline_quant = _pick_baseline_quant(all_sweep_results)
-        console.print(
-            f"Baseline quant: [yellow]{baseline_quant}[/yellow]"
-        )
-        all_sweep_results = scorer.score_sweep_results(all_sweep_results, baseline_quant)
+        all_sweep_results = scorer.score_sweep_results(all_sweep_results)
         console.print("[green]Quality scoring complete.[/green]\n")
 
         want_table = output_format in ("table", "all")
@@ -232,7 +251,7 @@ def main(
 
         if want_table:
             console.rule("[bold]Context Sweep Results[/bold]")
-            reporter.print_context_sweep_table(all_sweep_results)
+            reporter.print_context_sweep_table(all_sweep_results, hw_label=hw.label)
 
         if want_json or want_chart:
             console.rule("[bold]Saving Files[/bold]")
@@ -253,50 +272,45 @@ def main(
         return
 
     # ------------------------------------------------------------------ #
-    # 3b. Standard benchmark mode.                                        #
+    # 5b. Standard benchmark mode.                                        #
     # ------------------------------------------------------------------ #
     all_results: list[dict[str, Any]] = []
 
-    for model_name in model:
-        console.rule(f"[bold yellow]Model: {model_name}[/bold yellow]")
+    for model_info in model_list:
+        model_name = model_info["name"]
+        console.rule(f"[bold yellow]{model_name}[/bold yellow]")
 
-        variants = runner.list_model_variants(model_name)
-        console.print(
-            f"Found [bold]{len(variants)}[/bold] variant(s): "
-            + ", ".join(v["name"] for v in variants)
-        )
+        # Enrich hardware info with GPU layer count from /api/show.
+        show_data = runner.get_model_details(model_name)
+        enrich_with_gpu_layers(hw, show_data)
 
-        for variant in variants:
-            console.print(
-                f"\nBenchmarking [cyan]{variant['name']}[/cyan] "
-                f"(quant: [yellow]{variant['quant']}[/yellow]) …"
-            )
-            with console.status(f"Running {runs} × {len(prompt_list)} prompt(s)…"):
-                result = runner.run_benchmark(variant["name"], prompt_list, runs)
-            all_results.append(result)
-            console.print(
-                f"  [green]Done.[/green] Avg TTFT: "
-                f"{sum(p['avg_ttft_ms'] for p in result['prompts']) / len(result['prompts']):.1f} ms"
-            )
+        console.print(f"Benchmarking [cyan]{model_name}[/cyan] …")
+        with console.status(f"Running {runs} × {len(prompt_list)} prompt(s)…"):
+            result = runner.run_benchmark(model_name, prompt_list, runs)
+        all_results.append(result)
+
+        avg_ttft = sum(
+            p["avg_ttft_ms"] for p in result["prompts"]
+        ) / len(result["prompts"])
+        console.print(f"  [green]Done.[/green] Avg TTFT: {avg_ttft:.1f} ms")
 
     if not all_results:
         console.print("[bold red]No results collected. Exiting.[/bold red]")
         sys.exit(1)
 
     # ------------------------------------------------------------------ #
-    # 4. Quality scoring.                                                 #
+    # 6. Quality scoring.                                                 #
     # ------------------------------------------------------------------ #
     console.rule("[bold]Quality Scoring[/bold]")
-    baseline_quant = _pick_baseline_quant(all_results)
+    baseline = scorer.pick_baseline(all_results)
     console.print(
-        f"Baseline quant for quality scoring: [yellow]{baseline_quant}[/yellow]"
+        f"Baseline model (largest): [yellow]{baseline.get('name', '?')}[/yellow]"
     )
-
-    all_results = scorer.score_results(all_results, baseline_quant)
+    all_results = scorer.score_results(all_results, baseline=baseline)
     console.print("[green]Quality scoring complete.[/green]\n")
 
     # ------------------------------------------------------------------ #
-    # 5. Output.                                                          #
+    # 7. Output.                                                          #
     # ------------------------------------------------------------------ #
     want_table = output_format in ("table", "all")
     want_json = output_format in ("json", "all")
@@ -304,7 +318,7 @@ def main(
 
     if want_table:
         console.rule("[bold]Results Table[/bold]")
-        reporter.print_table(all_results)
+        reporter.print_table(all_results, hw_label=hw.label)
 
     if want_json or want_chart:
         console.rule("[bold]Saving Files[/bold]")
@@ -316,7 +330,6 @@ def main(
     if want_chart:
         reporter.save_chart(all_results)
 
-    # If only "table" was requested, still save JSON so results aren't lost.
     if output_format == "table":
         reporter.save_json(run_id, all_results)
         reporter.save_markdown(all_results)

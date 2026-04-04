@@ -1,6 +1,9 @@
 """BenchmarkRunner — core timing logic talking to the Ollama REST API."""
 
+from __future__ import annotations
+
 import json
+import re
 import time
 from typing import Any
 
@@ -32,9 +35,28 @@ def _resize_prompt(prompt: str, target_tokens: int) -> str:
     target_chars = target_tokens * CHARS_PER_TOKEN
     if len(prompt) >= target_chars:
         return prompt[:target_chars]
-    # Pad by repeating the prompt.
     reps = (target_chars // len(prompt)) + 1
     return (prompt * reps)[:target_chars]
+
+
+def parse_param_count(model_name: str) -> float:
+    """Extract parameter count (in billions) from a model name string.
+
+    Looks for patterns like ``3b``, ``7b``, ``14b``, ``70b``, ``0.5b``
+    anywhere in the name (case-insensitive).
+
+    Args:
+        model_name: Full model tag, e.g. ``"qwen2.5:14b"`` or
+            ``"llama3:8b-q4_K_M"``.
+
+    Returns:
+        Parameter count as a float (e.g. ``14.0``), or ``0.0`` if no match
+        is found.
+    """
+    match = re.search(r"(\d+(?:\.\d+)?)\s*b", model_name, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    return 0.0
 
 
 class OllamaConnectionError(Exception):
@@ -95,23 +117,23 @@ class BenchmarkRunner:
     # Model discovery
     # ------------------------------------------------------------------
 
-    def list_model_variants(self, model_name: str) -> list[dict[str, str]]:
-        """List all pulled variants of *model_name* that Ollama knows about.
+    def list_models(self, family: str | None = None) -> list[dict[str, str]]:
+        """List pulled models, optionally filtered by family prefix.
 
-        Queries ``GET /api/tags``, then filters the returned model list to
-        those whose tag starts with *model_name*.  The quantisation level is
-        extracted from the suffix after the last colon in the tag string (e.g.
-        ``llama3:8b-q4_K_M`` → ``Q4_K_M``).  Names without a recognisable
-        quant suffix are labelled ``"unknown"``.
+        Queries ``GET /api/tags`` and returns all pulled models.  If *family*
+        is provided, only models whose name starts with that prefix are
+        returned (e.g. ``"qwen2.5"`` matches ``"qwen2.5:3b"`` and
+        ``"qwen2.5:14b"``).
 
         Args:
-            model_name: The model name prefix to filter by, e.g. ``"llama3"``.
+            family: Optional model family prefix to filter by.
 
         Returns:
-            A list of dicts, each with keys ``"name"`` (full tag string) and
-            ``"quant"`` (upper-cased quant label).  If no matching models are
-            found, returns a single entry using *model_name* as-is with quant
-            ``"unknown"``.
+            A list of dicts, each with keys:
+
+            * ``"name"`` — full Ollama tag (e.g. ``"qwen2.5:7b"``)
+            * ``"params"`` — parameter count string parsed from the tag
+              (e.g. ``"7b"``), or ``"unknown"``
 
         Raises:
             OllamaConnectionError: If the API call fails.
@@ -128,31 +150,40 @@ class BenchmarkRunner:
         data: dict[str, Any] = response.json()
         all_models: list[dict[str, Any]] = data.get("models", [])
 
-        # Filter to models whose name starts with the requested prefix.
-        # Accept both exact matches ("llama3") and tagged variants ("llama3:…").
-        matching = [
-            m for m in all_models
-            if m.get("name", "").startswith(model_name)
-        ]
+        if family:
+            all_models = [
+                m for m in all_models
+                if m.get("name", "").startswith(family)
+            ]
 
-        if not matching:
-            # Model may be available but not listed (e.g., pulled under a
-            # slightly different name).  Return a best-effort entry.
-            return [{"name": model_name, "quant": "unknown"}]
+        result: list[dict[str, str]] = []
+        for m in all_models:
+            name: str = m.get("name", "")
+            param_count = parse_param_count(name)
+            params = f"{param_count:g}b" if param_count > 0 else "unknown"
+            result.append({"name": name, "params": params})
 
-        variants: list[dict[str, str]] = []
-        for m in matching:
-            full_name: str = m["name"]
-            # Extract the portion after the last colon as the quant label.
-            if ":" in full_name:
-                suffix = full_name.rsplit(":", 1)[-1]
-                # Normalise to uppercase for display.
-                quant = suffix.upper() if suffix else "unknown"
-            else:
-                quant = "unknown"
-            variants.append({"name": full_name, "quant": quant})
+        return result
 
-        return variants
+    def get_model_details(self, model_name: str) -> dict[str, Any]:
+        """Fetch model metadata from ``POST /api/show``.
+
+        Args:
+            model_name: Full Ollama model tag.
+
+        Returns:
+            Parsed JSON response dict, or an empty dict on failure.
+        """
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/show",
+                json={"name": model_name},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.RequestException:
+            return {}
 
     # ------------------------------------------------------------------
     # Single inference run
@@ -169,7 +200,7 @@ class BenchmarkRunner:
         * **RAM** — process RSS at the moment the response completes.
 
         Args:
-            model_name: Full Ollama model tag, e.g. ``"llama3:8b-q4_K_M"``.
+            model_name: Full Ollama model tag, e.g. ``"qwen2.5:7b"``.
             prompt: The prompt string to send.
 
         Returns:
@@ -212,7 +243,6 @@ class BenchmarkRunner:
 
                     chunk_text: str = chunk.get("response", "")
 
-                    # Record TTFT on the first non-empty content chunk.
                     if first_chunk_time is None and chunk_text:
                         first_chunk_time = time.perf_counter()
 
@@ -229,20 +259,14 @@ class BenchmarkRunner:
                 "Please make sure Ollama is running (run 'ollama serve')."
             )
 
-        # Fallback: if no non-empty chunk arrived, use the end time for TTFT.
         if first_chunk_time is None:
             first_chunk_time = time.perf_counter()
 
-        ttft_ms = calculate_ttft(start_time, first_chunk_time)
-        tokens_per_sec = calculate_throughput(eval_count, eval_duration_ns)
-        ram_gb = get_ram_usage_gb()
-        full_response = "".join(full_response_parts)
-
         return {
-            "ttft_ms": ttft_ms,
-            "tokens_per_sec": tokens_per_sec,
-            "response": full_response,
-            "ram_gb": ram_gb,
+            "ttft_ms": calculate_ttft(start_time, first_chunk_time),
+            "tokens_per_sec": calculate_throughput(eval_count, eval_duration_ns),
+            "response": "".join(full_response_parts),
+            "ram_gb": get_ram_usage_gb(),
         }
 
     # ------------------------------------------------------------------
@@ -268,28 +292,24 @@ class BenchmarkRunner:
                   Must be >= 2 to have at least one non-warmup run.
 
         Returns:
-            A dict matching the benchmark JSON schema::
+            A dict with keys ``"name"``, ``"params"``, and ``"prompts"``::
 
                 {
-                    "name": "llama3:8b-q4_K_M",
-                    "quant": "Q4_K_M",
+                    "name": "qwen2.5:7b",
+                    "params": "7b",
                     "prompts": [
                         {
                             "prompt": "...",
-                            "runs": [{"ttft_ms": ..., "tokens_per_sec": ..., "ram_gb": ...}],
+                            "runs": [...],
                             "avg_ttft_ms": 521.0,
-                            "avg_tokens_per_sec": 7.3,
+                            "avg_tokens_per_sec": 12.3,
                             "last_response": "..."
                         }
                     ]
                 }
         """
-        # Extract quant label from the model name tag.
-        if ":" in model_name:
-            suffix = model_name.rsplit(":", 1)[-1]
-            quant = suffix.upper() if suffix else "unknown"
-        else:
-            quant = "unknown"
+        param_count = parse_param_count(model_name)
+        params = f"{param_count:g}b" if param_count > 0 else "unknown"
 
         prompt_results: list[dict[str, Any]] = []
 
@@ -297,37 +317,30 @@ class BenchmarkRunner:
             run_records: list[dict[str, Any]] = []
             last_response: str = ""
 
-            for run_idx in range(runs):
+            for _ in range(runs):
                 result = self.run_single(model_name, prompt)
                 last_response = result["response"]
+                run_records.append({
+                    "ttft_ms": result["ttft_ms"],
+                    "tokens_per_sec": result["tokens_per_sec"],
+                    "ram_gb": result["ram_gb"],
+                })
 
-                run_records.append(
-                    {
-                        "ttft_ms": result["ttft_ms"],
-                        "tokens_per_sec": result["tokens_per_sec"],
-                        "ram_gb": result["ram_gb"],
-                    }
-                )
-
-            # Discard the first run (index 0 = warmup).
             real_runs = run_records[1:] if len(run_records) > 1 else run_records
-
             avg_ttft = sum(r["ttft_ms"] for r in real_runs) / len(real_runs)
             avg_tps = sum(r["tokens_per_sec"] for r in real_runs) / len(real_runs)
 
-            prompt_results.append(
-                {
-                    "prompt": prompt,
-                    "runs": run_records,
-                    "avg_ttft_ms": avg_ttft,
-                    "avg_tokens_per_sec": avg_tps,
-                    "last_response": last_response,
-                }
-            )
+            prompt_results.append({
+                "prompt": prompt,
+                "runs": run_records,
+                "avg_ttft_ms": avg_ttft,
+                "avg_tokens_per_sec": avg_tps,
+                "last_response": last_response,
+            })
 
         return {
             "name": model_name,
-            "quant": quant,
+            "params": params,
             "prompts": prompt_results,
         }
 
@@ -345,9 +358,7 @@ class BenchmarkRunner:
         """Benchmark *model_name* at multiple input context sizes.
 
         For each size in *context_sizes*, every prompt is truncated or padded
-        to approximately that many tokens before being sent to Ollama.  The
-        model's own context window is unchanged — this measures how input
-        length affects TTFT, throughput, and response quality.
+        to approximately that many tokens before being sent to Ollama.
 
         Args:
             model_name: Full Ollama model tag.
@@ -357,10 +368,9 @@ class BenchmarkRunner:
                 Defaults to ``DEFAULT_CONTEXT_SIZES`` (512, 2048, 4096).
 
         Returns:
-            A list of result dicts, one per context size.  Each dict is
-            identical to the output of :meth:`run_benchmark` but carries an
-            additional ``"context_size"`` key (int) and an
-            ``"original_prompt"`` key on every prompt dict.
+            A list of result dicts, one per context size, each with an
+            additional ``"context_size"`` key and ``"original_prompt"`` on
+            each prompt dict.
         """
         if context_sizes is None:
             context_sizes = DEFAULT_CONTEXT_SIZES
@@ -370,7 +380,6 @@ class BenchmarkRunner:
             resized_prompts = [_resize_prompt(p, ctx_size) for p in prompts]
             result = self.run_benchmark(model_name, resized_prompts, runs)
             result["context_size"] = ctx_size
-            # Annotate each prompt entry with the original (unresized) text.
             for i, prompt_dict in enumerate(result["prompts"]):
                 prompt_dict["original_prompt"] = prompts[i]
             sweep_results.append(result)

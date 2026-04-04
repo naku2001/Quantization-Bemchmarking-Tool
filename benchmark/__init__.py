@@ -1,1 +1,1 @@
-"""benchmark — core modules for the quant-bench LLM quantization benchmarking tool."""
+"""benchmark — core modules for the variant-bench model variant benchmarking tool."""
